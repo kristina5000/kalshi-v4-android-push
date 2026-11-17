@@ -1,14 +1,14 @@
-"""Kalshi 15-minute watch monitor; public data, ntfy push, no trading."""
+"""Kalshi V4.1 public market scanner. Signals only; never submits orders."""
 import datetime as dt
 import json
 import logging
 import os
-import re
 import sqlite3
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 
 API = 'https://api.elections.kalshi.com/trade-api/v2'
 TOPIC = os.getenv('NTFY_TOPIC', '').strip()
@@ -20,130 +20,174 @@ MIN_VOLUME = int(os.getenv('MIN_VOLUME', '20'))
 MAX_ALERTS = int(os.getenv('MAX_ALERTS_PER_HOUR', '12'))
 MIN_REMAIN = int(os.getenv('MIN_REMAIN_SECONDS', '120'))
 MAX_REMAIN = int(os.getenv('MAX_REMAIN_SECONDS', '900'))
-MAX_MARKETS = int(os.getenv('MAX_MARKETS_PER_SCAN', '2000'))
+MAX_MARKETS = max(1, int(os.getenv('MAX_MARKETS_PER_SCAN', '2000')))
 DB = os.getenv('DB_PATH', '/tmp/kalshi_alerts.sqlite3')
 SEND_TEST = os.getenv('SEND_STARTUP_TEST', 'true').lower() == 'true'
+LOG = logging.getLogger('kalshi-v4.1')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
 
-def request_json(url):
-    req = urllib.request.Request(url, headers={'Accept':'application/json', 'User-Agent':'Kalshi15mPushMonitor/4.0'})
-    with urllib.request.urlopen(req, timeout=25) as r:
-        return json.load(r)
+def get_json(url):
+    req = urllib.request.Request(url, headers={'User-Agent': 'kalshi-v4.1-watch/1.0', 'Accept': 'application/json'})
+    with urllib.request.urlopen(req, timeout=25) as response:
+        return json.load(response)
 
 
-def send_push(title, body, priority='default'):
-    if not TOPIC or not re.fullmatch(r'[A-Za-z0-9_-]{12,120}', TOPIC):
-        raise ValueError('Set NTFY_TOPIC to a private, random 12+ character topic')
+def push(title, body):
+    if not TOPIC:
+        raise RuntimeError('NTFY_TOPIC must be configured')
     url = NTFY_BASE + '/' + urllib.parse.quote(TOPIC, safe='')
-    req = urllib.request.Request(url, data=body.encode('utf-8'), method='POST', headers={
-        'Title':title.encode('ascii', errors='ignore').decode('ascii'),
-        'Priority':priority,
-        'Tags':'chart_with_upwards_trend',
-        'Content-Type':'text/plain; charset=utf-8',
-        'User-Agent':'Kalshi15mPushMonitor/4.0'
-    })
-    with urllib.request.urlopen(req, timeout=20) as r:
-        if r.status >= 300: raise RuntimeError(f'ntfy HTTP {r.status}')
+    req = urllib.request.Request(url, data=body.encode('utf-8'), headers={'Title': title.encode('ascii', 'ignore').decode('ascii'), 'Content-Type': 'text/plain; charset=utf-8'}, method='POST')
+    with urllib.request.urlopen(req, timeout=20) as response:
+        response.read()
 
 
-def epoch(s):
-    if not s: return None
-    try: return dt.datetime.fromisoformat(s.replace('Z','+00:00')).timestamp()
-    except (TypeError, ValueError): return None
+def database():
+    conn = sqlite3.connect(DB)
+    conn.execute('CREATE TABLE IF NOT EXISTS alerts (ticker TEXT PRIMARY KEY, sent_at INTEGER NOT NULL)')
+    conn.commit()
+    return conn
 
 
-def price(m, side):
-    d = m.get(side+'_dollars')
-    if d is not None:
-        try: return round(float(d)*100)
-        except (ValueError, TypeError): pass
-    try: return int(m[side]) if m.get(side) is not None else None
-    except (ValueError, TypeError): return None
+def parse_close(value):
+    if not value:
+        return None
+    try:
+        return dt.datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
+    except (TypeError, ValueError):
+        return None
 
 
-def is_15m(m):
-    # Recognize explicit 15-minute series or market duration. Not exhaustive.
-    series = str(m.get('series_ticker') or m.get('ticker') or '').split('-')[0].upper()
-    if re.search(r'15M(?:IN)?(?:$|[^A-Z])', series): return True
-    opened = epoch(m.get('open_time') or m.get('open_date'))
-    closes = epoch(m.get('close_time') or m.get('expiration_time'))
-    return bool(opened and closes and 840 <= closes-opened <= 960)
+def cents(m, key):
+    value = m.get(key)
+    if value is not None:
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return None
+    # Kalshi fixed-point dollar fields are strings; convert to cents.
+    value = m.get(key + '_dollars')
+    if value is not None:
+        try:
+            return round(float(value) * 100)
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
-def candidate(m, now):
-    if m.get('status') not in ('active','open') or not is_15m(m): return None
-    close = epoch(m.get('close_time') or m.get('expiration_time'))
-    if close is None or not MIN_REMAIN <= close-now <= MAX_REMAIN: return None
-    yb,ya,nb,na = (price(m,k) for k in ('yes_bid','yes_ask','no_bid','no_ask'))
-    if ya is None and nb is not None: ya=100-nb
-    if na is None and yb is not None: na=100-yb
-    if yb is None and na is not None: yb=100-na
-    if nb is None and ya is not None: nb=100-ya
-    if any(v is None for v in (yb,ya,nb,na)): return None
-    if not (0 <= yb <= ya <= 100 and 0 <= nb <= na <= 100): return None
-    if ya-yb > MAX_SPREAD or na-nb > MAX_SPREAD: return None
-    try: vol = int(m.get('volume') or 0)
-    except (ValueError,TypeError): vol=0
-    if vol < MIN_VOLUME: return None
-    # Cheaper side is shown for monitoring only, not a recommendation.
-    side,ask,bid = ('YES',ya,yb) if ya <= na else ('NO',na,nb)
-    if not 1 <= ask <= 90: return None
-    contracts = int(MAX_TRADE*100 // ask)
-    if contracts < 1: return None
-    return side,ask,ask-bid,vol,contracts,int(close-now)
+def volume(m):
+    for key in ('volume', 'volume_fp'):
+        try:
+            if m.get(key) is not None:
+                return float(m[key])
+        except (ValueError, TypeError):
+            pass
+    return 0.0
 
 
-def init_db():
-    con=sqlite3.connect(DB)
-    con.execute('CREATE TABLE IF NOT EXISTS alerts (ticker TEXT PRIMARY KEY, sent_at INTEGER NOT NULL)')
-    con.commit()
-    return con
+def evaluate(m, now):
+    ticker = str(m.get('ticker', ''))
+    if not ticker:
+        return 'missing_ticker', None
+    if m.get('status') != 'active':
+        return 'inactive', None
+    close = parse_close(m.get('close_time') or m.get('expiration_time'))
+    if close is None:
+        return 'missing_close_time', None
+    remaining = close - now
+    if not MIN_REMAIN <= remaining <= MAX_REMAIN:
+        return 'outside_time_window', None
+    if volume(m) < MIN_VOLUME:
+        return 'low_volume', None
+    yes_bid, yes_ask = cents(m, 'yes_bid'), cents(m, 'yes_ask')
+    no_bid, no_ask = cents(m, 'no_bid'), cents(m, 'no_ask')
+    choices = []
+    for side, bid, ask in (('YES', yes_bid, yes_ask), ('NO', no_bid, no_ask)):
+        if bid is None or ask is None or not (0 < bid <= ask < 100):
+            continue
+        spread = ask - bid
+        if spread <= MAX_SPREAD:
+            choices.append((spread, side, bid, ask))
+    if not choices:
+        return 'missing_quotes_or_wide_spread', None
+    spread, side, bid, ask = min(choices)
+    return 'eligible', {'ticker': ticker, 'title': str(m.get('title', ticker)), 'side': side, 'bid': bid, 'ask': ask, 'spread': spread, 'remaining': int(remaining), 'volume': volume(m)}
 
 
-def scan(con):
-    now=time.time(); cursor=None; scanned=0; matched=0; sent=0
-    recent=con.execute('SELECT COUNT(*) FROM alerts WHERE sent_at>?', (int(now-3600),)).fetchone()[0]
-    while scanned < MAX_MARKETS:
-        params={'status':'open','limit':str(min(200,MAX_MARKETS-scanned))}
-        if cursor: params['cursor']=cursor
-        data=request_json(API+'/markets?'+urllib.parse.urlencode(params))
-        markets=data.get('markets') or []
-        if not markets: break
-        scanned += len(markets)
-        for m in markets:
-            c=candidate(m,now)
-            if not c: continue
-            matched+=1
-            if recent+sent >= MAX_ALERTS: continue
-            ticker=str(m.get('ticker') or '')
-            if not ticker or con.execute('SELECT 1 FROM alerts WHERE ticker=?',(ticker,)).fetchone(): continue
-            side,ask,spread,vol,qty,remaining=c
-            title='Kalshi 15m MARKET WATCH'
-            body=(f'{m.get("title","Market")}\nTicker: {ticker}\n'
-                  f'Cheaper quoted side: {side} at {ask}c | spread {spread}c | volume {vol}\n'
-                  f'Time remaining: {remaining//60}m {remaining%60}s\n'
-                  f'Up to {qty} contracts; entry cost ${qty*ask/100:.2f} before fees (cap ${MAX_TRADE:.2f}).\n'
-                  'WATCH ONLY: Not a win prediction or positive-edge signal. Check current quotes, fees and settlement rules.')
-            send_push(title,body)
-            con.execute('INSERT INTO alerts(ticker,sent_at) VALUES (?,?)',(ticker,int(now)))
-            con.commit()
-            sent+=1
-        cursor=data.get('cursor')
-        if not cursor: break
-    logging.info('Scanned=%d eligible=%d notifications=%d',scanned,matched,sent)
+def fetch_markets():
+    markets = []
+    cursor = ''
+    seen = set()
+    while len(markets) < MAX_MARKETS:
+        query = {'limit': min(1000, MAX_MARKETS - len(markets)), 'status': 'open'}
+        if cursor:
+            query['cursor'] = cursor
+        payload = get_json(API + '/markets?' + urllib.parse.urlencode(query))
+        batch = payload.get('markets', [])
+        if not isinstance(batch, list) or not batch:
+            break
+        markets.extend(batch)
+        next_cursor = payload.get('cursor') or ''
+        if not next_cursor or next_cursor in seen:
+            break
+        seen.add(next_cursor)
+        cursor = next_cursor
+    return markets
 
 
 def main():
-    if not TOPIC: raise SystemExit('NTFY_TOPIC must be configured')
-    con=init_db()
-    logging.info('Kalshi V4 started; push-only; no trading; cap $%.2f',MAX_TRADE)
+    if not TOPIC:
+        raise RuntimeError('NTFY_TOPIC must be configured')
+    conn = database()
+    LOG.info('Kalshi V4.1 started; signals-only; no trading; suggested cap $%.2f', MAX_TRADE)
     if SEND_TEST:
-        try: send_push('Kalshi V4 connected','Startup test: your hosted scanner is running. No trade was placed.')
-        except Exception: logging.exception('Startup notification failed')
+        try:
+            push('Kalshi V4.1 connected', 'Startup test: your hosted scanner is running. No trade was placed.')
+            LOG.info('Startup ntfy test sent')
+        except Exception:
+            LOG.exception('Startup ntfy test failed')
     while True:
-        try: scan(con)
-        except Exception: logging.exception('Scan failed; retrying')
-        time.sleep(POLL)
+        started = time.time()
+        try:
+            markets = fetch_markets()
+            counts = Counter()
+            candidates = []
+            for market in markets:
+                reason, candidate = evaluate(market, started)
+                counts[reason] += 1
+                if candidate:
+                    candidates.append(candidate)
+            LOG.info('Scanned=%d eligible=%d rejection_reasons=%s', len(markets), len(candidates), json.dumps(dict(counts), sort_keys=True))
+            # Eligibility is NOT a statistical trading edge; alerts are market watch candidates only.
+            sent = 0
+            hour_ago = int(started) - 3600
+            conn.execute('DELETE FROM alerts WHERE sent_at < ?', (hour_ago,))
+            conn.commit()
+            quota = max(0, MAX_ALERTS - conn.execute('SELECT COUNT(*) FROM alerts').fetchone()[0])
+            for candidate in sorted(candidates, key=lambda x: (x['spread'], -x['volume'])):
+                if sent >= quota:
+                    break
+                ticker = candidate['ticker']
+                if conn.execute('SELECT 1 FROM alerts WHERE ticker=?', (ticker,)).fetchone():
+                    continue
+                message = (f"{candidate['title']}\nTicker: {ticker}\nWatch side: {candidate['side']} "
+                           f"bid {candidate['bid']}c / ask {candidate['ask']}c; spread {candidate['spread']}c\n"
+                           f"Volume: {candidate['volume']:g}; time left: {candidate['remaining']}s\n"
+                           f"Market watch only, NOT a predicted edge. Suggested cap ${MAX_TRADE:.2f}; no trade placed.")
+                try:
+                    push('Kalshi market watch', message)
+                    conn.execute('INSERT INTO alerts(ticker, sent_at) VALUES (?, ?)', (ticker, int(time.time())))
+                    conn.commit()
+                    sent += 1
+                except Exception:
+                    LOG.exception('Failed to notify ticker=%s', ticker)
+            LOG.info('notifications=%d', sent)
+            if len(markets) >= MAX_MARKETS:
+                LOG.info('Scan reached MAX_MARKETS_PER_SCAN=%d; this is a sample, not all open markets', MAX_MARKETS)
+        except Exception:
+            LOG.exception('Scan failed; will retry')
+        time.sleep(max(1, POLL - (time.time() - started)))
 
-if __name__=='__main__': main()
+
+if __name__ == '__main__':
+    main()
